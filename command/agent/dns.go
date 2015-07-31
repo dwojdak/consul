@@ -185,8 +185,11 @@ func (d *DNSServer) handlePtr(resp dns.ResponseWriter, req *dns.Msg) {
 	qName := strings.ToLower(dns.Fqdn(req.Question[0].Name))
 
 	args := structs.DCSpecificRequest{
-		Datacenter:   datacenter,
-		QueryOptions: structs.QueryOptions{AllowStale: d.config.AllowStale},
+		Datacenter: datacenter,
+		QueryOptions: structs.QueryOptions{
+			Token:      d.agent.config.ACLToken,
+			AllowStale: d.config.AllowStale,
+		},
 	}
 	var out structs.IndexedNodes
 
@@ -204,6 +207,12 @@ func (d *DNSServer) handlePtr(resp dns.ResponseWriter, req *dns.Msg) {
 				break
 			}
 		}
+	}
+
+	// nothing found locally, recurse
+	if len(m.Answer) == 0 {
+		d.handleRecurse(resp, req)
+		return
 	}
 
 	// Write out the complete response
@@ -333,6 +342,7 @@ PARSE:
 	return
 INVALID:
 	d.logger.Printf("[WARN] dns: QName invalid: %s", qName)
+	d.addSOA(d.domain, resp)
 	resp.SetRcode(req, dns.RcodeNameError)
 }
 
@@ -346,9 +356,12 @@ func (d *DNSServer) nodeLookup(network, datacenter, node string, req, resp *dns.
 
 	// Make an RPC request
 	args := structs.NodeSpecificRequest{
-		Datacenter:   datacenter,
-		Node:         node,
-		QueryOptions: structs.QueryOptions{AllowStale: d.config.AllowStale},
+		Datacenter: datacenter,
+		Node:       node,
+		QueryOptions: structs.QueryOptions{
+			Token:      d.agent.config.ACLToken,
+			AllowStale: d.config.AllowStale,
+		},
 	}
 	var out structs.IndexedNodeServices
 RPC:
@@ -367,6 +380,7 @@ RPC:
 
 	// If we have no address, return not found!
 	if out.NodeServices == nil {
+		d.addSOA(d.domain, resp)
 		resp.SetRcode(req, dns.RcodeNameError)
 		return
 	}
@@ -446,11 +460,14 @@ func (d *DNSServer) formatNodeRecord(node *structs.Node, addr, qName string, qTy
 func (d *DNSServer) serviceLookup(network, datacenter, service, tag string, req, resp *dns.Msg) {
 	// Make an RPC request
 	args := structs.ServiceSpecificRequest{
-		Datacenter:   datacenter,
-		ServiceName:  service,
-		ServiceTag:   tag,
-		TagFilter:    tag != "",
-		QueryOptions: structs.QueryOptions{AllowStale: d.config.AllowStale},
+		Datacenter:  datacenter,
+		ServiceName: service,
+		ServiceTag:  tag,
+		TagFilter:   tag != "",
+		QueryOptions: structs.QueryOptions{
+			Token:      d.agent.config.ACLToken,
+			AllowStale: d.config.AllowStale,
+		},
 	}
 	var out structs.IndexedCheckServiceNodes
 RPC:
@@ -467,12 +484,6 @@ RPC:
 		goto RPC
 	}
 
-	// If we have no nodes, return not found!
-	if len(out.Nodes) == 0 {
-		resp.SetRcode(req, dns.RcodeNameError)
-		return
-	}
-
 	// Determine the TTL
 	var ttl time.Duration
 	if d.config.ServiceTTL != nil {
@@ -485,6 +496,13 @@ RPC:
 
 	// Filter out any service nodes due to health checks
 	out.Nodes = d.filterServiceNodes(out.Nodes)
+
+	// If we have no nodes, return not found!
+	if len(out.Nodes) == 0 {
+		d.addSOA(d.domain, resp)
+		resp.SetRcode(req, dns.RcodeNameError)
+		return
+	}
 
 	// Perform a random shuffle
 	shuffleServiceNodes(out.Nodes)

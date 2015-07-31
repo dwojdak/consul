@@ -19,6 +19,7 @@ import (
 /*
  * Contains an entry for each private block:
  * 10.0.0.0/8
+ * 100.64.0.0/10
  * 172.16.0.0/12
  * 192.168/16
  */
@@ -41,7 +42,8 @@ func (s *serverParts) String() string {
 
 func init() {
 	// Add each private block
-	privateBlocks = make([]*net.IPNet, 3)
+	privateBlocks = make([]*net.IPNet, 4)
+
 	_, block, err := net.ParseCIDR("10.0.0.0/8")
 	if err != nil {
 		panic(fmt.Sprintf("Bad cidr. Got %v", err))
@@ -59,6 +61,12 @@ func init() {
 		panic(fmt.Sprintf("Bad cidr. Got %v", err))
 	}
 	privateBlocks[2] = block
+
+	_, block, err = net.ParseCIDR("100.64.0.0/10")
+	if err != nil {
+		panic(fmt.Sprintf("Bad cidr. Got %v", err))
+	}
+	privateBlocks[3] = block
 }
 
 // strContains checks if a list contains a string
@@ -161,6 +169,8 @@ func GetPrivateIP() (net.IP, error) {
 		return nil, fmt.Errorf("Failed to get interface addresses: %v", err)
 	}
 
+	var candidates []net.IP
+
 	// Find private IPv4 address
 	for _, rawAddr := range addresses {
 		var ip net.IP
@@ -179,11 +189,17 @@ func GetPrivateIP() (net.IP, error) {
 		if !isPrivateIP(ip.String()) {
 			continue
 		}
-
-		return ip, nil
+		candidates = append(candidates, ip)
 	}
-
-	return nil, fmt.Errorf("No private IP address found")
+	numIps := len(candidates)
+	switch numIps {
+	case 0:
+		return nil, fmt.Errorf("No private IP address found")
+	case 1:
+		return candidates[0], nil
+	default:
+		return nil, fmt.Errorf("Multiple private IPs found. Please configure one.")
+	}
 }
 
 // Converts bytes to an integer

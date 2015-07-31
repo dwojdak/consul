@@ -285,7 +285,9 @@ definitions support being updated during a reload.
   Note that the `acl_master_token` is only installed when a server acquires cluster leadership. If
   you would like to install or change the `acl_master_token`, set the new value for `acl_master_token`
   in the configuration for all servers. Once this is done, restart the current leader to force a
-  leader election.
+  leader election. If the acl_master_token is not supplied, then the servers do not create a master
+  token. When you provide a value, it can be any string value. Using a UUID would ensure that it looks
+  the same as the other tokens, but isn't strictly necessary.
 
 * <a name="acl_token"></a><a href="#acl_token">`acl_token`</a> - When provided, the agent will use this
   token when making requests to the Consul servers. Clients can override this token on a per-request
@@ -321,6 +323,16 @@ definitions support being updated during a reload.
 
 * <a name="advertise_addr"></a><a href="#advertise_addr">`advertise_addr`</a> Equivalent to
   the [`-advertise` command-line flag](#_advertise).
+
+* <a name="advertise_addrs"></a><a href="#advertise_addrs">`advertise_addrs`</a> Allows to set
+  the advertised addresses for SerfLan, SerfWan and RPC together with the port. This gives
+  you more control than (#_advertise) or (#_advertise-wan) while it serves the same purpose.
+  These settings might override (#_advertise) and (#_advertise-wan).
+  <br><br>
+  This is a nested setting that allows the following keys:
+  * `serf_lan` - The SerfLan address. Accepts values in the form of "host:port" like "10.23.31.101:8301".
+  * `serf_wan` - The SerfWan address. Accepts values in the form of "host:port" like "10.23.31.101:8302".
+  * `rpc` - The RPC address. Accepts values in the form of "host:port" like "10.23.31.101:8400".
 
 * <a name="advertise_addr_wan"></a><a href="#advertise_addr_wan">`advertise_addr_wan`</a> Equivalent to
   the [`-advertise-wan` command-line flag](#_advertise-wan).

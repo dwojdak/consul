@@ -62,13 +62,14 @@ the DNS interface as well. If a service is failing its health check or a
 node has any failing system-level check, the DNS interface will omit that
 node from any service query.
 
-The check must be of the script, HTTP, or TTL type. If it is a script type, `script`
-and `interval` must be provided. If it is a HTTP type, `http` and
-`interval` must be provided. If it is a TTL type, then only `ttl` must be
-provided. The check name is automatically generated as
-`service:<service-id>`. If there are multiple service checks registered, the
-ID will be generated as `service:<service-id>:<num>` where `<num>` is an
-incrementing number starting from `1`.
+The check must be of the script, HTTP, TCP or TTL type. If it is a script type,
+`script` and `interval` must be provided. If it is a HTTP type, `http` and
+`interval` must be provided. If it is a TCP type, `tcp` and `interval` must be
+provided. If it is a TTL type, then only `ttl` must be provided. The check name
+is automatically generated as `service:<service-id>`. If there are multiple
+service checks registered, the ID will be generated as
+`service:<service-id>:<num>` where `<num>` is an incrementing number starting
+from `1`.
 
 Note: there is more information about [checks here](/docs/agent/checks.html). 
 
@@ -123,3 +124,16 @@ Multiple services definitions can be provided at once using the `services`
   ]
 }
 ```
+
+## Service and Tag Names with DNS
+
+Consul exposes service definitions and tags over the [DNS](/docs/agent/dns.html)
+interface. DNS queries have a strict set of allowed characters and a
+well-defined format that Consul cannot override. While it is possible to
+register services or tags with names that don't match the conventions, those
+services and tags will not be discoverable via the DNS interface. It is
+recommended to always use DNS-compliant service and tag names.
+
+DNS-compliant service and tag names may contain any alpha-numeric characters, as
+well as dashes. Dots are not supported because Consul internally uses them to
+delimit service tags.

@@ -59,6 +59,10 @@ type TestServerConfig struct {
 	Bind              string             `json:"bind_addr,omitempty"`
 	Addresses         *TestAddressConfig `json:"addresses,omitempty"`
 	Ports             *TestPortConfig    `json:"ports,omitempty"`
+	ACLMasterToken    string             `json:"acl_master_token,omitempty"`
+	ACLDatacenter     string             `json:"acl_datacenter,omitempty"`
+	ACLDefaultPolicy  string             `json:"acl_default_policy,omitempty"`
+	Stdout, Stderr    io.Writer          `json:"-"`
 }
 
 // ServerConfigCallback is a function interface which can be
@@ -165,10 +169,20 @@ func NewTestServerConfig(t *testing.T, cb ServerConfigCallback) *TestServer {
 	}
 	configFile.Close()
 
+	stdout := io.Writer(os.Stdout)
+	if consulConfig.Stdout != nil {
+		stdout = consulConfig.Stdout
+	}
+
+	stderr := io.Writer(os.Stderr)
+	if consulConfig.Stderr != nil {
+		stderr = consulConfig.Stderr
+	}
+
 	// Start the server
 	cmd := exec.Command("consul", "agent", "-config-file", configFile.Name())
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("err: %s", err)
 	}

@@ -268,6 +268,9 @@ func TestClientServer_UserEvent(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
+	// Wait for the leader
+	testutil.WaitForLeader(t, s1.RPC, "dc1")
+
 	// Check the members
 	testutil.WaitForResult(func() (bool, error) {
 		return len(c1.LANMembers()) == 2 && len(s1.LANMembers()) == 2, nil
@@ -276,26 +279,24 @@ func TestClientServer_UserEvent(t *testing.T) {
 	})
 
 	// Fire the user event
-	err := c1.UserEvent("foo", []byte("bar"))
-	if err != nil {
-		t.Fatalf("err: %v", err)
+	client := rpcClient(t, s1)
+	event := structs.EventFireRequest{
+		Name:       "foo",
+		Datacenter: "dc1",
+		Payload:    []byte("baz"),
 	}
-
-	err = s1.UserEvent("bar", []byte("baz"))
-	if err != nil {
+	if err := client.Call("Internal.EventFire", &event, nil); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	// Wait for all the events
-	var serverFoo, serverBar, clientFoo, clientBar bool
-	for i := 0; i < 4; i++ {
+	var clientReceived, serverReceived bool
+	for i := 0; i < 2; i++ {
 		select {
 		case e := <-clientOut:
 			switch e.Name {
 			case "foo":
-				clientFoo = true
-			case "bar":
-				clientBar = true
+				clientReceived = true
 			default:
 				t.Fatalf("Bad: %#v", e)
 			}
@@ -303,9 +304,7 @@ func TestClientServer_UserEvent(t *testing.T) {
 		case e := <-serverOut:
 			switch e.Name {
 			case "foo":
-				serverFoo = true
-			case "bar":
-				serverBar = true
+				serverReceived = true
 			default:
 				t.Fatalf("Bad: %#v", e)
 			}
@@ -315,7 +314,7 @@ func TestClientServer_UserEvent(t *testing.T) {
 		}
 	}
 
-	if !(serverFoo && serverBar && clientFoo && clientBar) {
+	if !serverReceived || !clientReceived {
 		t.Fatalf("missing events")
 	}
 }

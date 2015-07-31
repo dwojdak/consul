@@ -13,22 +13,38 @@ import (
 	"github.com/miekg/dns"
 )
 
-func makeDNSServer(t *testing.T, config *DNSConfig, recursor *dns.Server) (string, *DNSServer) {
-	if config == nil {
-		config = &DNSConfig{}
+func makeDNSServer(t *testing.T) (string, *DNSServer) {
+	return makeDNSServerConfig(t, nil, nil)
+}
+
+func makeDNSServerConfig(
+	t *testing.T,
+	agentFn func(c *Config),
+	dnsFn func(*DNSConfig)) (string, *DNSServer) {
+	// Create the configs and apply the functions
+	agentConf := nextConfig()
+	if agentFn != nil {
+		agentFn(agentConf)
 	}
-	recursors := []string{}
-	if recursor != nil {
-		recursors = append(recursors, recursor.Addr)
+	dnsConf := &DNSConfig{}
+	if dnsFn != nil {
+		dnsFn(dnsConf)
 	}
-	conf := nextConfig()
-	addr, _ := conf.ClientListener(conf.Addresses.DNS, conf.Ports.DNS)
-	dir, agent := makeAgent(t, conf)
-	server, err := NewDNSServer(agent, config, agent.logOutput,
-		conf.Domain, addr.String(), recursors)
+
+	// Add in the recursor if any
+	if r := agentConf.DNSRecursor; r != "" {
+		agentConf.DNSRecursors = append(agentConf.DNSRecursors, r)
+	}
+
+	// Start the server
+	addr, _ := agentConf.ClientListener(agentConf.Addresses.DNS, agentConf.Ports.DNS)
+	dir, agent := makeAgent(t, agentConf)
+	server, err := NewDNSServer(agent, dnsConf, agent.logOutput,
+		agentConf.Domain, addr.String(), agentConf.DNSRecursors)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+
 	return dir, server
 }
 
@@ -90,7 +106,7 @@ func TestRecursorAddr(t *testing.T) {
 }
 
 func TestDNS_NodeLookup(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -157,10 +173,32 @@ func TestDNS_NodeLookup(t *testing.T) {
 	if aRec.Hdr.Ttl != 0 {
 		t.Fatalf("Bad: %#v", in.Answer[0])
 	}
+
+	// lookup a non-existing node, we should receive a SOA
+	m = new(dns.Msg)
+	m.SetQuestion("nofoo.node.dc1.consul.", dns.TypeANY)
+
+	c = new(dns.Client)
+	in, _, err = c.Exchange(m, addr.String())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if len(in.Ns) != 1 {
+		t.Fatalf("Bad: %#v %#v", in, len(in.Answer))
+	}
+
+	soaRec, ok := in.Ns[0].(*dns.SOA)
+	if !ok {
+		t.Fatalf("Bad: %#v", in.Ns[0])
+	}
+	if soaRec.Hdr.Ttl != 0 {
+		t.Fatalf("Bad: %#v", in.Ns[0])
+	}
 }
 
 func TestDNS_CaseInsensitiveNodeLookup(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -194,7 +232,7 @@ func TestDNS_CaseInsensitiveNodeLookup(t *testing.T) {
 }
 
 func TestDNS_NodeLookup_PeriodName(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -236,7 +274,7 @@ func TestDNS_NodeLookup_PeriodName(t *testing.T) {
 }
 
 func TestDNS_NodeLookup_AAAA(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -287,7 +325,9 @@ func TestDNS_NodeLookup_CNAME(t *testing.T) {
 	})
 	defer recursor.Shutdown()
 
-	dir, srv := makeDNSServer(t, nil, recursor)
+	dir, srv := makeDNSServerConfig(t, func(c *Config) {
+		c.DNSRecursor = recursor.Addr
+	}, nil)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -333,7 +373,7 @@ func TestDNS_NodeLookup_CNAME(t *testing.T) {
 }
 
 func TestDNS_ReverseLookup(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -375,7 +415,7 @@ func TestDNS_ReverseLookup(t *testing.T) {
 }
 
 func TestDNS_ReverseLookup_CustomDomain(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 	srv.domain = dns.Fqdn("custom")
@@ -418,7 +458,7 @@ func TestDNS_ReverseLookup_CustomDomain(t *testing.T) {
 }
 
 func TestDNS_ReverseLookup_IPV6(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -460,7 +500,7 @@ func TestDNS_ReverseLookup_IPV6(t *testing.T) {
 }
 
 func TestDNS_ServiceLookup(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -524,10 +564,33 @@ func TestDNS_ServiceLookup(t *testing.T) {
 	if aRec.Hdr.Ttl != 0 {
 		t.Fatalf("Bad: %#v", in.Extra[0])
 	}
+
+	// lookup a non-existing service, we should receive a SOA
+	m = new(dns.Msg)
+	m.SetQuestion("nodb.service.consul.", dns.TypeSRV)
+
+	c = new(dns.Client)
+	addr, _ = srv.agent.config.ClientListener("", srv.agent.config.Ports.DNS)
+	in, _, err = c.Exchange(m, addr.String())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if len(in.Ns) != 1 {
+		t.Fatalf("Bad: %#v", in)
+	}
+
+	soaRec, ok := in.Ns[0].(*dns.SOA)
+	if !ok {
+		t.Fatalf("Bad: %#v", in.Ns[0])
+	}
+	if soaRec.Hdr.Ttl != 0 {
+		t.Fatalf("Bad: %#v", in.Ns[0])
+	}
 }
 
 func TestDNS_ServiceLookup_ServiceAddress(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -595,7 +658,7 @@ func TestDNS_ServiceLookup_ServiceAddress(t *testing.T) {
 }
 
 func TestDNS_CaseInsensitiveServiceLookup(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -634,7 +697,7 @@ func TestDNS_CaseInsensitiveServiceLookup(t *testing.T) {
 }
 
 func TestDNS_ServiceLookup_TagPeriod(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -695,7 +758,7 @@ func TestDNS_ServiceLookup_TagPeriod(t *testing.T) {
 }
 
 func TestDNS_ServiceLookup_Dedup(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -772,7 +835,7 @@ func TestDNS_ServiceLookup_Dedup(t *testing.T) {
 }
 
 func TestDNS_ServiceLookup_Dedup_SRV(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -880,7 +943,9 @@ func TestDNS_Recurse(t *testing.T) {
 	recursor := makeRecursor(t, []dns.RR{dnsA("apple.com", "1.2.3.4")})
 	defer recursor.Shutdown()
 
-	dir, srv := makeDNSServer(t, nil, recursor)
+	dir, srv := makeDNSServerConfig(t, func(c *Config) {
+		c.DNSRecursor = recursor.Addr
+	}, nil)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -903,7 +968,7 @@ func TestDNS_Recurse(t *testing.T) {
 }
 
 func TestDNS_ServiceLookup_FilterCritical(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -1033,8 +1098,98 @@ func TestDNS_ServiceLookup_FilterCritical(t *testing.T) {
 	}
 }
 
+func TestDNS_ServiceLookup_OnlyFailing(t *testing.T) {
+	dir, srv := makeDNSServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.agent.Shutdown()
+
+	testutil.WaitForLeader(t, srv.agent.RPC, "dc1")
+
+	// Register nodes
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			Service: "db",
+			Tags:    []string{"master"},
+			Port:    12345,
+		},
+		Check: &structs.HealthCheck{
+			CheckID: "serf",
+			Name:    "serf",
+			Status:  structs.HealthCritical,
+		},
+	}
+
+	var out struct{}
+	if err := srv.agent.RPC("Catalog.Register", args, &out); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	args2 := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "bar",
+		Address:    "127.0.0.2",
+		Service: &structs.NodeService{
+			Service: "db",
+			Tags:    []string{"master"},
+			Port:    12345,
+		},
+		Check: &structs.HealthCheck{
+			CheckID: "serf",
+			Name:    "serf",
+			Status:  structs.HealthCritical,
+		},
+	}
+	if err := srv.agent.RPC("Catalog.Register", args2, &out); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	args3 := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "bar",
+		Address:    "127.0.0.2",
+		Service: &structs.NodeService{
+			Service: "db",
+			Tags:    []string{"master"},
+			Port:    12345,
+		},
+		Check: &structs.HealthCheck{
+			CheckID:   "db",
+			Name:      "db",
+			ServiceID: "db",
+			Status:    structs.HealthCritical,
+		},
+	}
+	if err := srv.agent.RPC("Catalog.Register", args3, &out); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	m := new(dns.Msg)
+	m.SetQuestion("db.service.consul.", dns.TypeANY)
+
+	c := new(dns.Client)
+	addr, _ := srv.agent.config.ClientListener("", srv.agent.config.Ports.DNS)
+	in, _, err := c.Exchange(m, addr.String())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// All 3 are failing, so we should get 0 answers and an NXDOMAIN response
+	if len(in.Answer) != 0 {
+		t.Fatalf("Bad: %#v", in)
+	}
+
+	if in.Rcode != dns.RcodeNameError {
+		t.Fatalf("Bad: %#v", in)
+	}
+}
+
 func TestDNS_ServiceLookup_OnlyPassing(t *testing.T) {
-	dir, srv := makeDNSServer(t, &DNSConfig{OnlyPassing: true}, nil)
+	dir, srv := makeDNSServerConfig(t, nil, func(c *DNSConfig) {
+		c.OnlyPassing = true
+	})
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -1150,7 +1305,7 @@ func TestDNS_ServiceLookup_OnlyPassing(t *testing.T) {
 }
 
 func TestDNS_ServiceLookup_Randomize(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -1218,10 +1373,9 @@ func TestDNS_ServiceLookup_Randomize(t *testing.T) {
 }
 
 func TestDNS_ServiceLookup_Truncate(t *testing.T) {
-	config := &DNSConfig{
-		EnableTruncate: true,
-	}
-	dir, srv := makeDNSServer(t, config, nil)
+	dir, srv := makeDNSServerConfig(t, nil, func(c *DNSConfig) {
+		c.EnableTruncate = true
+	})
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -1269,7 +1423,9 @@ func TestDNS_ServiceLookup_CNAME(t *testing.T) {
 	})
 	defer recursor.Shutdown()
 
-	dir, srv := makeDNSServer(t, nil, recursor)
+	dir, srv := makeDNSServerConfig(t, func(c *Config) {
+		c.DNSRecursor = recursor.Addr
+	}, nil)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -1337,13 +1493,13 @@ func TestDNS_NodeLookup_TTL(t *testing.T) {
 	})
 	defer recursor.Shutdown()
 
-	config := &DNSConfig{
-		NodeTTL:    10 * time.Second,
-		AllowStale: true,
-		MaxStale:   time.Second,
-	}
-
-	dir, srv := makeDNSServer(t, config, recursor)
+	dir, srv := makeDNSServerConfig(t, func(c *Config) {
+		c.DNSRecursor = recursor.Addr
+	}, func(c *DNSConfig) {
+		c.NodeTTL = 10 * time.Second
+		c.AllowStale = true
+		c.MaxStale = time.Second
+	})
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -1456,16 +1612,16 @@ func TestDNS_NodeLookup_TTL(t *testing.T) {
 }
 
 func TestDNS_ServiceLookup_TTL(t *testing.T) {
-	config := &DNSConfig{
-		ServiceTTL: map[string]time.Duration{
+	confFn := func(c *DNSConfig) {
+		c.ServiceTTL = map[string]time.Duration{
 			"db": 10 * time.Second,
 			"*":  5 * time.Second,
-		},
-		AllowStale: true,
-		MaxStale:   time.Second,
-	}
+		}
+		c.AllowStale = true
+		c.MaxStale = time.Second
 
-	dir, srv := makeDNSServer(t, config, nil)
+	}
+	dir, srv := makeDNSServerConfig(t, nil, confFn)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -1560,7 +1716,7 @@ func TestDNS_ServiceLookup_TTL(t *testing.T) {
 }
 
 func TestDNS_ServiceLookup_SRV_RFC(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -1627,7 +1783,7 @@ func TestDNS_ServiceLookup_SRV_RFC(t *testing.T) {
 }
 
 func TestDNS_ServiceLookup_SRV_RFC_TCP_Default(t *testing.T) {
-	dir, srv := makeDNSServer(t, nil, nil)
+	dir, srv := makeDNSServer(t)
 	defer os.RemoveAll(dir)
 	defer srv.agent.Shutdown()
 
@@ -1691,4 +1847,91 @@ func TestDNS_ServiceLookup_SRV_RFC_TCP_Default(t *testing.T) {
 	if aRec.Hdr.Ttl != 0 {
 		t.Fatalf("Bad: %#v", in.Extra[0])
 	}
+}
+
+func TestDNS_ServiceLookup_FilterACL(t *testing.T) {
+	confFn := func(c *Config) {
+		c.ACLMasterToken = "root"
+		c.ACLDatacenter = "dc1"
+		c.ACLDownPolicy = "deny"
+		c.ACLDefaultPolicy = "deny"
+	}
+	dir, srv := makeDNSServerConfig(t, confFn, nil)
+	defer os.RemoveAll(dir)
+	defer srv.agent.Shutdown()
+
+	testutil.WaitForLeader(t, srv.agent.RPC, "dc1")
+
+	// Register a service
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			Service: "foo",
+			Port:    12345,
+		},
+		WriteRequest: structs.WriteRequest{Token: "root"},
+	}
+	var out struct{}
+	if err := srv.agent.RPC("Catalog.Register", args, &out); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Set up the DNS query
+	c := new(dns.Client)
+	addr, _ := srv.agent.config.ClientListener("", srv.agent.config.Ports.DNS)
+	m := new(dns.Msg)
+	m.SetQuestion("foo.service.consul.", dns.TypeA)
+
+	// Query with the root token. Should get results.
+	srv.agent.config.ACLToken = "root"
+	in, _, err := c.Exchange(m, addr.String())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(in.Answer) != 1 {
+		t.Fatalf("Bad: %#v", in)
+	}
+
+	// Query with a non-root token without access. Should get nothing.
+	srv.agent.config.ACLToken = "anonymous"
+	in, _, err = c.Exchange(m, addr.String())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(in.Answer) != 0 {
+		t.Fatalf("Bad: %#v", in)
+	}
+}
+
+func TestDNS_NonExistingLookup(t *testing.T) {
+	dir, srv := makeDNSServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.agent.Shutdown()
+
+	addr, _ := srv.agent.config.ClientListener("", srv.agent.config.Ports.DNS)
+
+	// lookup a non-existing node, we should receive a SOA
+	m := new(dns.Msg)
+	m.SetQuestion("nonexisting.consul.", dns.TypeANY)
+
+	c := new(dns.Client)
+	in, _, err := c.Exchange(m, addr.String())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if len(in.Ns) != 1 {
+		t.Fatalf("Bad: %#v %#v", in, len(in.Answer))
+	}
+
+	soaRec, ok := in.Ns[0].(*dns.SOA)
+	if !ok {
+		t.Fatalf("Bad: %#v", in.Ns[0])
+	}
+	if soaRec.Hdr.Ttl != 0 {
+		t.Fatalf("Bad: %#v", in.Ns[0])
+	}
+
 }

@@ -20,7 +20,7 @@ a single holder is allowed, and a lock is used for mutual exclusion. This
 uses the [leader election algorithm](/docs/guides/leader-election.html).
 
 If the lock holder count is more than one, then a semaphore is used instead.
-A semaphore allows more than a single holder, but the is less efficient than
+A semaphore allows more than a single holder, but this is less efficient than
 a simple lock. This follows the [semaphore algorithm](/docs/guides/semaphore.html).
 
 All locks using the same prefix must agree on the value of `-n`. If conflicting
@@ -40,10 +40,10 @@ The prefix must be writable. The child is invoked only when the lock is held,
 and the `CONSUL_LOCK_HELD` environment variable will be set to `true`.
 
 If the lock is lost, communication is disrupted, or the parent process
-interrupted, the child process will receive a `SIGTERM`. After a grace period,
-a `SIGKILL` will be used to force termination.  
-For Consul agents on Windows, the child process is always terminated with a
-`SIGKILL`, since Windows has no POSIX compatible notion for `SIGTERM`.
+interrupted, the child process will receive a `SIGTERM`. After a grace period
+of 5 seconds, a `SIGKILL` will be used to force termination. For Consul agents
+on Windows, the child process is always terminated with a `SIGKILL`, since
+Windows has no POSIX compatible notion for `SIGTERM`.
 
 The list of available flags are:
 

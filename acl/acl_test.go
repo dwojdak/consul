@@ -47,6 +47,18 @@ func TestStaticACL(t *testing.T) {
 	if !all.ServiceWrite("foobar") {
 		t.Fatalf("should allow")
 	}
+	if !all.EventRead("foobar") {
+		t.Fatalf("should allow")
+	}
+	if !all.EventWrite("foobar") {
+		t.Fatalf("should allow")
+	}
+	if !all.KeyringRead() {
+		t.Fatalf("should allow")
+	}
+	if !all.KeyringWrite() {
+		t.Fatalf("should allow")
+	}
 	if all.ACLList() {
 		t.Fatalf("should not allow")
 	}
@@ -66,11 +78,29 @@ func TestStaticACL(t *testing.T) {
 	if none.ServiceWrite("foobar") {
 		t.Fatalf("should not allow")
 	}
+	if none.EventRead("foobar") {
+		t.Fatalf("should not allow")
+	}
+	if none.EventRead("") {
+		t.Fatalf("should not allow")
+	}
+	if none.EventWrite("foobar") {
+		t.Fatalf("should not allow")
+	}
+	if none.EventWrite("") {
+		t.Fatalf("should not allow")
+	}
+	if none.KeyringRead() {
+		t.Fatalf("should now allow")
+	}
+	if none.KeyringWrite() {
+		t.Fatalf("should not allow")
+	}
 	if none.ACLList() {
-		t.Fatalf("should not noneow")
+		t.Fatalf("should not allow")
 	}
 	if none.ACLModify() {
-		t.Fatalf("should not noneow")
+		t.Fatalf("should not allow")
 	}
 
 	if !manage.KeyRead("foobar") {
@@ -83,6 +113,18 @@ func TestStaticACL(t *testing.T) {
 		t.Fatalf("should allow")
 	}
 	if !manage.ServiceWrite("foobar") {
+		t.Fatalf("should allow")
+	}
+	if !manage.EventRead("foobar") {
+		t.Fatalf("should allow")
+	}
+	if !manage.EventWrite("foobar") {
+		t.Fatalf("should allow")
+	}
+	if !manage.KeyringRead() {
+		t.Fatalf("should allow")
+	}
+	if !manage.KeyringWrite() {
 		t.Fatalf("should allow")
 	}
 	if !manage.ACLList() {
@@ -130,6 +172,20 @@ func TestPolicyACL(t *testing.T) {
 			&ServicePolicy{
 				Name:   "barfoo",
 				Policy: ServicePolicyWrite,
+			},
+		},
+		Events: []*EventPolicy{
+			&EventPolicy{
+				Event:  "",
+				Policy: EventPolicyRead,
+			},
+			&EventPolicy{
+				Event:  "foo",
+				Policy: EventPolicyWrite,
+			},
+			&EventPolicy{
+				Event:  "bar",
+				Policy: EventPolicyDeny,
 			},
 		},
 	}
@@ -186,6 +242,28 @@ func TestPolicyACL(t *testing.T) {
 		}
 		if c.write != acl.ServiceWrite(c.inp) {
 			t.Fatalf("Write fail: %#v", c)
+		}
+	}
+
+	// Test the events
+	type eventcase struct {
+		inp   string
+		read  bool
+		write bool
+	}
+	eventcases := []eventcase{
+		{"foo", true, true},
+		{"foobar", true, true},
+		{"bar", false, false},
+		{"barbaz", false, false},
+		{"baz", true, false},
+	}
+	for _, c := range eventcases {
+		if c.read != acl.EventRead(c.inp) {
+			t.Fatalf("Event fail: %#v", c)
+		}
+		if c.write != acl.EventWrite(c.inp) {
+			t.Fatalf("Event fail: %#v", c)
 		}
 	}
 }
@@ -289,6 +367,33 @@ func TestPolicyACL_Parent(t *testing.T) {
 		}
 		if c.write != acl.ServiceWrite(c.inp) {
 			t.Fatalf("Write fail: %#v", c)
+		}
+	}
+}
+
+func TestPolicyACL_Keyring(t *testing.T) {
+	// Test keyring ACLs
+	type keyringcase struct {
+		inp   string
+		read  bool
+		write bool
+	}
+	keyringcases := []keyringcase{
+		{"", false, false},
+		{KeyringPolicyRead, true, false},
+		{KeyringPolicyWrite, true, true},
+		{KeyringPolicyDeny, false, false},
+	}
+	for _, c := range keyringcases {
+		acl, err := New(DenyAll(), &Policy{Keyring: c.inp})
+		if err != nil {
+			t.Fatalf("bad: %s", err)
+		}
+		if acl.KeyringRead() != c.read {
+			t.Fatalf("bad: %#v", c)
+		}
+		if acl.KeyringWrite() != c.write {
+			t.Fatalf("bad: %#v", c)
 		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/consul/consul"
 	"github.com/hashicorp/consul/consul/structs"
@@ -22,7 +24,8 @@ const (
 	servicesDir = "services"
 
 	// Path to save local agent checks
-	checksDir = "checks"
+	checksDir     = "checks"
+	checkStateDir = "checks/state"
 
 	// The ID of the faux health checks for maintenance mode
 	serviceMaintCheckPrefix = "_service_maintenance"
@@ -71,6 +74,9 @@ type Agent struct {
 
 	// checkHTTPs maps the check ID to an associated HTTP check
 	checkHTTPs map[string]*CheckHTTP
+
+	// checkTCPs maps the check ID to an associated TCP check
+	checkTCPs map[string]*CheckTCP
 
 	// checkTTLs maps the check ID to an associated check TTL
 	checkTTLs map[string]*CheckTTL
@@ -142,6 +148,7 @@ func Create(config *Config, logOutput io.Writer) (*Agent, error) {
 		checkMonitors: make(map[string]*CheckMonitor),
 		checkTTLs:     make(map[string]*CheckTTL),
 		checkHTTPs:    make(map[string]*CheckHTTP),
+		checkTCPs:     make(map[string]*CheckTCP),
 		eventCh:       make(chan serf.UserEvent, 1024),
 		eventBuf:      make([]*UserEvent, 256),
 		shutdownCh:    make(chan struct{}),
@@ -242,6 +249,17 @@ func (a *Agent) consulConfig() *consul.Config {
 			IP:   net.ParseIP(a.config.AdvertiseAddr),
 			Port: a.config.Ports.Server,
 		}
+	}
+	if a.config.AdvertiseAddrs.SerfLan != nil {
+		base.SerfLANConfig.MemberlistConfig.AdvertiseAddr = a.config.AdvertiseAddrs.SerfLan.IP.String()
+		base.SerfLANConfig.MemberlistConfig.AdvertisePort = a.config.AdvertiseAddrs.SerfLan.Port
+	}
+	if a.config.AdvertiseAddrs.SerfWan != nil {
+		base.SerfWANConfig.MemberlistConfig.AdvertiseAddr = a.config.AdvertiseAddrs.SerfWan.IP.String()
+		base.SerfWANConfig.MemberlistConfig.AdvertisePort = a.config.AdvertiseAddrs.SerfWan.Port
+	}
+	if a.config.AdvertiseAddrs.RPC != nil {
+		base.RPCAdvertise = a.config.AdvertiseAddrs.RPC
 	}
 	if a.config.Bootstrap {
 		base.Bootstrap = true
@@ -423,6 +441,10 @@ func (a *Agent) Shutdown() error {
 	}
 
 	for _, chk := range a.checkHTTPs {
+		chk.Stop()
+	}
+
+	for _, chk := range a.checkTCPs {
 		chk.Stop()
 	}
 
@@ -756,6 +778,13 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *CheckType, persist
 				TTL:     chkType.TTL,
 				Logger:  a.logger,
 			}
+
+			// Restore persisted state, if any
+			if err := a.loadCheckState(check); err != nil {
+				a.logger.Printf("[WARN] agent: failed restoring state for check %q: %s",
+					check.CheckID, err)
+			}
+
 			ttl.Start()
 			a.checkTTLs[check.CheckID] = ttl
 
@@ -779,6 +808,27 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *CheckType, persist
 			}
 			http.Start()
 			a.checkHTTPs[check.CheckID] = http
+
+		} else if chkType.IsTCP() {
+			if existing, ok := a.checkTCPs[check.CheckID]; ok {
+				existing.Stop()
+			}
+			if chkType.Interval < MinInterval {
+				a.logger.Println(fmt.Sprintf("[WARN] agent: check '%s' has interval below minimum of %v",
+					check.CheckID, MinInterval))
+				chkType.Interval = MinInterval
+			}
+
+			tcp := &CheckTCP{
+				Notify:   &a.state,
+				CheckID:  check.CheckID,
+				TCP:      chkType.TCP,
+				Interval: chkType.Interval,
+				Timeout:  chkType.Timeout,
+				Logger:   a.logger,
+			}
+			tcp.Start()
+			a.checkTCPs[check.CheckID] = tcp
 
 		} else {
 			if existing, ok := a.checkMonitors[check.CheckID]; ok {
@@ -836,12 +886,21 @@ func (a *Agent) RemoveCheck(checkID string, persist bool) error {
 		check.Stop()
 		delete(a.checkHTTPs, checkID)
 	}
+	if check, ok := a.checkTCPs[checkID]; ok {
+		check.Stop()
+		delete(a.checkTCPs, checkID)
+	}
 	if check, ok := a.checkTTLs[checkID]; ok {
 		check.Stop()
 		delete(a.checkTTLs, checkID)
 	}
 	if persist {
-		return a.purgeCheck(checkID)
+		if err := a.purgeCheck(checkID); err != nil {
+			return err
+		}
+		if err := a.purgeCheckState(checkID); err != nil {
+			return err
+		}
 	}
 	log.Printf("[DEBUG] agent: removed check %q", checkID)
 	return nil
@@ -860,7 +919,86 @@ func (a *Agent) UpdateCheck(checkID, status, output string) error {
 
 	// Set the status through CheckTTL to reset the TTL
 	check.SetStatus(status, output)
+
+	// Always persist the state for TTL checks
+	if err := a.persistCheckState(check, status, output); err != nil {
+		return fmt.Errorf("failed persisting state for check %q: %s", checkID, err)
+	}
+
 	return nil
+}
+
+// persistCheckState is used to record the check status into the data dir.
+// This allows the state to be restored on a later agent start. Currently
+// only useful for TTL based checks.
+func (a *Agent) persistCheckState(check *CheckTTL, status, output string) error {
+	// Create the persisted state
+	state := persistedCheckState{
+		CheckID: check.CheckID,
+		Status:  status,
+		Output:  output,
+		Expires: time.Now().Add(check.TTL).Unix(),
+	}
+
+	// Encode the state
+	buf, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+
+	// Create the state dir if it doesn't exist
+	dir := filepath.Join(a.config.DataDir, checkStateDir)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("failed creating check state dir %q: %s", dir, err)
+	}
+
+	// Write the state to the file
+	file := filepath.Join(dir, stringHash(check.CheckID))
+	if err := ioutil.WriteFile(file, buf, 0600); err != nil {
+		return fmt.Errorf("failed writing file %q: %s", file, err)
+	}
+
+	return nil
+}
+
+// loadCheckState is used to restore the persisted state of a check.
+func (a *Agent) loadCheckState(check *structs.HealthCheck) error {
+	// Try to read the persisted state for this check
+	file := filepath.Join(a.config.DataDir, checkStateDir, stringHash(check.CheckID))
+	buf, err := ioutil.ReadFile(file)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed reading file %q: %s", file, err)
+	}
+
+	// Decode the state data
+	var p persistedCheckState
+	if err := json.Unmarshal(buf, &p); err != nil {
+		return fmt.Errorf("failed decoding check state: %s", err)
+	}
+
+	// Check if the state has expired
+	if time.Now().Unix() >= p.Expires {
+		a.logger.Printf("[DEBUG] agent: check state expired for %q, not restoring", check.CheckID)
+		return a.purgeCheckState(check.CheckID)
+	}
+
+	// Restore the fields from the state
+	check.Output = p.Output
+	check.Status = p.Status
+	return nil
+}
+
+// purgeCheckState is used to purge the state of a check from the data dir
+func (a *Agent) purgeCheckState(checkID string) error {
+	file := filepath.Join(a.config.DataDir, checkStateDir, stringHash(checkID))
+	err := os.Remove(file)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 // Stats is used to get various debugging state from the sub-systems
@@ -955,54 +1093,61 @@ func (a *Agent) loadServices(conf *Config) error {
 
 	// Load any persisted services
 	svcDir := filepath.Join(a.config.DataDir, servicesDir)
-	if _, err := os.Stat(svcDir); os.IsNotExist(err) {
-		return nil
-	}
-
-	err := filepath.Walk(svcDir, func(path string, fi os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if fi.Name() == servicesDir {
+	files, err := ioutil.ReadDir(svcDir)
+	if err != nil {
+		if os.IsNotExist(err) {
 			return nil
 		}
-		filePath := filepath.Join(svcDir, fi.Name())
-		fh, err := os.Open(filePath)
+		return fmt.Errorf("Failed reading services dir %q: %s", svcDir, err)
+	}
+	for _, fi := range files {
+		// Skip all dirs
+		if fi.IsDir() {
+			continue
+		}
+
+		// Open the file for reading
+		file := filepath.Join(svcDir, fi.Name())
+		fh, err := os.Open(file)
 		if err != nil {
-			return err
-		}
-		content := make([]byte, fi.Size())
-		if _, err := fh.Read(content); err != nil {
-			return err
+			return fmt.Errorf("failed opening service file %q: %s", file, err)
 		}
 
-		var wrapped *persistedService
-		var token string
-		var svc *structs.NodeService
-		if err := json.Unmarshal(content, &wrapped); err != nil {
+		// Read the contents into a buffer
+		buf, err := ioutil.ReadAll(fh)
+		fh.Close()
+		if err != nil {
+			return fmt.Errorf("failed reading service file %q: %s", file, err)
+		}
+
+		// Try decoding the service definition
+		var p persistedService
+		if err := json.Unmarshal(buf, &p); err != nil {
 			// Backwards-compatibility for pre-0.5.1 persisted services
-			if err := json.Unmarshal(content, &svc); err != nil {
-				return fmt.Errorf("failed decoding service from %s: %s", filePath, err)
+			if err := json.Unmarshal(buf, &p.Service); err != nil {
+				return fmt.Errorf("failed decoding service file %q: %s", file, err)
 			}
-		} else {
-			svc = wrapped.Service
-			token = wrapped.Token
 		}
+		serviceID := p.Service.ID
 
-		if _, ok := a.state.services[svc.ID]; ok {
+		if _, ok := a.state.services[serviceID]; ok {
 			// Purge previously persisted service. This allows config to be
 			// preferred over services persisted from the API.
 			a.logger.Printf("[DEBUG] agent: service %q exists, not restoring from %q",
-				svc.ID, filePath)
-			return a.purgeService(svc.ID)
+				serviceID, file)
+			if err := a.purgeService(serviceID); err != nil {
+				return fmt.Errorf("failed purging service %q: %s", serviceID, err)
+			}
 		} else {
 			a.logger.Printf("[DEBUG] agent: restored service definition %q from %q",
-				svc.ID, filePath)
-			return a.AddService(svc, nil, false, token)
+				serviceID, file)
+			if err := a.AddService(p.Service, nil, false, p.Token); err != nil {
+				return fmt.Errorf("failed adding service %q: %s", serviceID, err)
+			}
 		}
-	})
+	}
 
-	return err
+	return nil
 }
 
 // unloadServices will deregister all services other than the 'consul' service
@@ -1034,38 +1179,48 @@ func (a *Agent) loadChecks(conf *Config) error {
 
 	// Load any persisted checks
 	checkDir := filepath.Join(a.config.DataDir, checksDir)
-	if _, err := os.Stat(checkDir); os.IsNotExist(err) {
-		return nil
-	}
-
-	err := filepath.Walk(checkDir, func(path string, fi os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if fi.Name() == checksDir {
+	files, err := ioutil.ReadDir(checkDir)
+	if err != nil {
+		if os.IsNotExist(err) {
 			return nil
 		}
-		filePath := filepath.Join(checkDir, fi.Name())
-		fh, err := os.Open(filePath)
+		return fmt.Errorf("Failed reading checks dir %q: %s", checkDir, err)
+	}
+	for _, fi := range files {
+		// Ignore dirs - we only care about the check definition files
+		if fi.IsDir() {
+			continue
+		}
+
+		// Open the file for reading
+		file := filepath.Join(checkDir, fi.Name())
+		fh, err := os.Open(file)
 		if err != nil {
-			return err
-		}
-		content := make([]byte, fi.Size())
-		if _, err := fh.Read(content); err != nil {
-			return err
+			return fmt.Errorf("Failed opening check file %q: %s", file, err)
 		}
 
+		// Read the contents into a buffer
+		buf, err := ioutil.ReadAll(fh)
+		fh.Close()
+		if err != nil {
+			return fmt.Errorf("failed reading check file %q: %s", file, err)
+		}
+
+		// Decode the check
 		var p persistedCheck
-		if err := json.Unmarshal(content, &p); err != nil {
-			return err
+		if err := json.Unmarshal(buf, &p); err != nil {
+			return fmt.Errorf("Failed decoding check file %q: %s", file, err)
 		}
+		checkID := p.Check.CheckID
 
-		if _, ok := a.state.checks[p.Check.CheckID]; ok {
+		if _, ok := a.state.checks[checkID]; ok {
 			// Purge previously persisted check. This allows config to be
 			// preferred over persisted checks from the API.
 			a.logger.Printf("[DEBUG] agent: check %q exists, not restoring from %q",
-				p.Check.CheckID, filePath)
-			return a.purgeCheck(p.Check.CheckID)
+				checkID, file)
+			if err := a.purgeCheck(checkID); err != nil {
+				return fmt.Errorf("Failed purging check %q: %s", checkID, err)
+			}
 		} else {
 			// Default check to critical to avoid placing potentially unhealthy
 			// services into the active pool
@@ -1074,17 +1229,17 @@ func (a *Agent) loadChecks(conf *Config) error {
 			if err := a.AddCheck(p.Check, p.ChkType, false, p.Token); err != nil {
 				// Purge the check if it is unable to be restored.
 				a.logger.Printf("[WARN] agent: Failed to restore check %q: %s",
-					p.Check.CheckID, err)
-				return a.purgeCheck(p.Check.CheckID)
+					checkID, err)
+				if err := a.purgeCheck(checkID); err != nil {
+					return fmt.Errorf("Failed purging check %q: %s", checkID, err)
+				}
 			}
-
 			a.logger.Printf("[DEBUG] agent: restored health check %q from %q",
-				p.Check.CheckID, filePath)
-			return nil
+				p.Check.CheckID, file)
 		}
-	})
+	}
 
-	return err
+	return nil
 }
 
 // unloadChecks will deregister all checks known to the local agent.

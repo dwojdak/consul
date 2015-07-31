@@ -31,13 +31,34 @@ There are three different kinds of checks:
   It is possible to configure a custom HTTP check timeout value by specifying
   the `timeout` field in the check definition.
 
+* TCP + Interval - These checks make an TCP connection attempt every Interval
+  (e.g. every 30 seconds) to the specified IP/hostname and port. The status of
+  the service depends on whether the connection attempt is successful (ie - the
+  port is currently accepting connections). If the connection is accepted, the
+  status is `success`, otherwise the status is `critical`. In the case of a
+  hostname that resolves to both IPv4 and IPv6 addresses, an attempt will be
+  made to both addresses, and the first successful connection attempt will
+  result in a successful check. This type of check should be preferred over a
+  script that uses `netcat` or another external process to check a simple socket
+  operation. By default, TCP checks will be configured with a request timeout
+  equal to the check interval, with a max of 10 seconds. It is possible to
+  configure a custom TCP check timeout value by specifying the `timeout` field
+  in the check definition.
+
 * <a name="TTL"></a>Time to Live (TTL) - These checks retain their last known state for a given TTL.
   The state of the check must be updated periodically over the HTTP interface. If an
   external system fails to update the status within a given TTL, the check is
   set to the failed state. This mechanism, conceptually similar to a dead man's switch,
   relies on the application to directly report its health. For example, a healthy app
   can periodically `PUT` a status update to the HTTP endpoint; if the app fails, the TTL will
-  expire and the health check enters a critical state.
+  expire and the health check enters a critical state. The endpoints used to
+  update health information for a given check are the
+  [pass endpoint](https://consul.io/docs/agent/http/agent.html#agent_check_pass)
+  and the [fail endpoint](https://consul.io/docs/agent/http/agent.html#agent_check_fail).
+  TTL checks also persist
+  their last known status to disk. This allows the Consul agent to restore the
+  last known status of the check across restarts. Persisted check status is
+  valid through the end of the TTL from the time of the last check.
 
 ## Check Definition
 
@@ -62,6 +83,20 @@ A HTTP check:
     "id": "api",
     "name": "HTTP API on port 5000",
     "http": "http://localhost:5000/health",
+    "interval": "10s",
+    "timeout": "1s"
+  }
+}
+```
+
+A TCP check:
+
+```javascript
+{
+  "check": {
+    "id": "ssh",
+    "name": "SSH TCP on port 22",
+    "tcp": "localhost:22",
     "interval": "10s",
     "timeout": "1s"
   }
@@ -95,6 +130,13 @@ Checks may also contain a `token` field to provide an ACL token. This token is
 used for any interaction with the catalog for the check, including
 [anti-entropy syncs](/docs/internals/anti-entropy.html) and deregistration.
 
+Script, TCP and HTTP checks must include an `interval` field. This field is
+parsed by Go's `time` package, and has the following
+[formatting specification](http://golang.org/pkg/time/#ParseDuration):
+> A duration string is a possibly signed sequence of decimal numbers, each with
+> optional fraction and a unit suffix, such as "300ms", "-1.5h" or "2h45m".
+> Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
+
 To configure a check, either provide it as a `-config-file` option to the
 agent or place it inside the `-config-dir` of the agent. The file must
 end in the ".json" extension to be loaded by Consul. Check definitions can
@@ -114,6 +156,29 @@ this convention:
 This is the only convention that Consul depends on. Any output of the script
 will be captured and stored in the `notes` field so that it can be viewed
 by human operators.
+
+## Initial Health Check Status
+
+By default, when checks are registered against a Consul agent, the state is set
+immediately to "critical". This is useful to prevent services from being
+registered as "passing" and entering the service pool before they are confirmed
+to be healthy. In certain cases, it may be desirable to specify the initial
+state of a health check. This can be done by specifying the `status` field in a
+health check definition, like so:
+
+```javascript
+{
+  "check": {
+    "id": "mem",
+    "script": "/bin/check_mem",
+    "interval": "10s",
+    "status": "passing"
+  }
+}
+```
+
+The above service definition would cause the new "mem" check to be
+registered with its initial state set to "passing".
 
 ## Service-bound checks
 

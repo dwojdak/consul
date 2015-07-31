@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -131,6 +132,37 @@ func TestAgent_RPCPing(t *testing.T) {
 	var out struct{}
 	if err := agent.RPC("Status.Ping", struct{}{}, &out); err != nil {
 		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestAgent_CheckAdvertiseAddrsSettings(t *testing.T) {
+	c := nextConfig()
+	c.AdvertiseAddrs.SerfLan, _ = net.ResolveTCPAddr("tcp", "127.0.0.42:1233")
+	c.AdvertiseAddrs.SerfWan, _ = net.ResolveTCPAddr("tcp", "127.0.0.43:1234")
+	c.AdvertiseAddrs.RPC, _ = net.ResolveTCPAddr("tcp", "127.0.0.44:1235")
+	dir, agent := makeAgent(t, c)
+	defer os.RemoveAll(dir)
+	defer agent.Shutdown()
+
+	serfLanAddr := agent.consulConfig().SerfLANConfig.MemberlistConfig.AdvertiseAddr
+	if serfLanAddr != "127.0.0.42" {
+		t.Fatalf("SerfLan is not properly set to '127.0.0.42': %s", serfLanAddr)
+	}
+	serfLanPort := agent.consulConfig().SerfLANConfig.MemberlistConfig.AdvertisePort
+	if serfLanPort != 1233 {
+		t.Fatalf("SerfLan is not properly set to '1233': %d", serfLanPort)
+	}
+	serfWanAddr := agent.consulConfig().SerfWANConfig.MemberlistConfig.AdvertiseAddr
+	if serfWanAddr != "127.0.0.43" {
+		t.Fatalf("SerfWan is not properly set to '127.0.0.43': %s", serfWanAddr)
+	}
+	serfWanPort := agent.consulConfig().SerfWANConfig.MemberlistConfig.AdvertisePort
+	if serfWanPort != 1234 {
+		t.Fatalf("SerfWan is not properly set to '1234': %d", serfWanPort)
+	}
+	rpc := agent.consulConfig().RPCAdvertise
+	if rpc != c.AdvertiseAddrs.RPC {
+		t.Fatalf("RPC is not properly set to %v: %s", c.AdvertiseAddrs.RPC, rpc)
 	}
 }
 
@@ -456,6 +488,49 @@ func TestAgent_AddCheck_MissingService(t *testing.T) {
 	err := agent.AddCheck(health, chk, false, "")
 	if err == nil || err.Error() != `ServiceID "baz" does not exist` {
 		t.Fatalf("expected service id error, got: %v", err)
+	}
+}
+
+func TestAgent_AddCheck_RestoreState(t *testing.T) {
+	dir, agent := makeAgent(t, nextConfig())
+	defer os.RemoveAll(dir)
+	defer agent.Shutdown()
+
+	// Create some state and persist it
+	ttl := &CheckTTL{
+		CheckID: "baz",
+		TTL:     time.Minute,
+	}
+	err := agent.persistCheckState(ttl, structs.HealthPassing, "yup")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Build and register the check definition and initial state
+	health := &structs.HealthCheck{
+		Node:    "foo",
+		CheckID: "baz",
+		Name:    "baz check 1",
+	}
+	chk := &CheckType{
+		TTL: time.Minute,
+	}
+	err = agent.AddCheck(health, chk, false, "")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Ensure the check status was restored during registration
+	checks := agent.state.Checks()
+	check, ok := checks["baz"]
+	if !ok {
+		t.Fatalf("missing check")
+	}
+	if check.Status != structs.HealthPassing {
+		t.Fatalf("bad: %#v", check)
+	}
+	if check.Output != "yup" {
+		t.Fatalf("bad: %#v", check)
 	}
 }
 
@@ -1347,5 +1422,148 @@ func TestAgent_loadChecks_checkFails(t *testing.T) {
 	// Ensure the erroneous check was purged
 	if _, err := os.Stat(checkPath); err == nil {
 		t.Fatalf("should have purged check")
+	}
+}
+
+func TestAgent_persistCheckState(t *testing.T) {
+	config := nextConfig()
+	dir, agent := makeAgent(t, config)
+	defer os.RemoveAll(dir)
+	defer agent.Shutdown()
+
+	// Create the TTL check to persist
+	check := &CheckTTL{
+		CheckID: "check1",
+		TTL:     10 * time.Minute,
+	}
+
+	// Persist some check state for the check
+	err := agent.persistCheckState(check, structs.HealthCritical, "nope")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Check the persisted file exists and has the content
+	file := filepath.Join(agent.config.DataDir, checkStateDir, stringHash("check1"))
+	buf, err := ioutil.ReadFile(file)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Decode the state
+	var p persistedCheckState
+	if err := json.Unmarshal(buf, &p); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Check the fields
+	if p.CheckID != "check1" {
+		t.Fatalf("bad: %#v", p)
+	}
+	if p.Output != "nope" {
+		t.Fatalf("bad: %#v", p)
+	}
+	if p.Status != structs.HealthCritical {
+		t.Fatalf("bad: %#v", p)
+	}
+
+	// Check the expiration time was set
+	if p.Expires < time.Now().Unix() {
+		t.Fatalf("bad: %#v", p)
+	}
+}
+
+func TestAgent_loadCheckState(t *testing.T) {
+	config := nextConfig()
+	dir, agent := makeAgent(t, config)
+	defer os.RemoveAll(dir)
+	defer agent.Shutdown()
+
+	// Create a check whose state will expire immediately
+	check := &CheckTTL{
+		CheckID: "check1",
+		TTL:     0,
+	}
+
+	// Persist the check state
+	err := agent.persistCheckState(check, structs.HealthPassing, "yup")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Try to load the state
+	health := &structs.HealthCheck{
+		CheckID: "check1",
+		Status:  structs.HealthCritical,
+	}
+	if err := agent.loadCheckState(health); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Should not have restored the status due to expiration
+	if health.Status != structs.HealthCritical {
+		t.Fatalf("bad: %#v", health)
+	}
+	if health.Output != "" {
+		t.Fatalf("bad: %#v", health)
+	}
+
+	// Should have purged the state
+	file := filepath.Join(agent.config.DataDir, checksDir, stringHash("check1"))
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		t.Fatalf("should have purged state")
+	}
+
+	// Set a TTL which will not expire before we check it
+	check.TTL = time.Minute
+	err = agent.persistCheckState(check, structs.HealthPassing, "yup")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Try to load
+	if err := agent.loadCheckState(health); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Should have restored
+	if health.Status != structs.HealthPassing {
+		t.Fatalf("bad: %#v", health)
+	}
+	if health.Output != "yup" {
+		t.Fatalf("bad: %#v", health)
+	}
+}
+
+func TestAgent_purgeCheckState(t *testing.T) {
+	config := nextConfig()
+	dir, agent := makeAgent(t, config)
+	defer os.RemoveAll(dir)
+	defer agent.Shutdown()
+
+	// No error if the state does not exist
+	if err := agent.purgeCheckState("check1"); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Persist some state to the data dir
+	check := &CheckTTL{
+		CheckID: "check1",
+		TTL:     time.Minute,
+	}
+	err := agent.persistCheckState(check, structs.HealthPassing, "yup")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Purge the check state
+	if err := agent.purgeCheckState("check1"); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Removed the file
+	file := filepath.Join(agent.config.DataDir, checkStateDir, stringHash("check1"))
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		t.Fatalf("should have removed file")
 	}
 }

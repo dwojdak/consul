@@ -1,3 +1,39 @@
+## 0.6.0 (Unreleased)
+
+FEATURES:
+
+* Service ACL's apply to service discovery [GH-1024]
+
+BUG FIXES:
+
+* Allow services with `/` characters in the UI [GH-988]
+* Token hiding in HTTP logs bug fixed [GH-1020]
+* RFC6598 addresses are accepted as private IP's [GH-1050]
+
+IMPROVEMENTS:
+
+* Advertised gossip/rpc addresses can now be configured [GH-1004]
+
+MISC:
+
+* Protocol version bumped to 3 for serf protocol 5 [GH-996]
+* Vagrantfile fixed for VMware [GH-1042]
+
+## 0.5.2 (May 18, 2015)
+
+FEATURES:
+
+* Include datacenter in the `members` output
+* HTTP Health Check sets user agent "Consul Health Check" [GH-951]
+
+BUG FIXES:
+
+* Fixed memory leak caused by blocking query [GH-939]
+
+MISC:
+
+* Remove unused constant [GH-941]
+
 ## 0.5.1 (May 13, 2015)
 
 FEATURES:
